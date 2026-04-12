@@ -2,13 +2,14 @@
 //!
 //! SSB expects `.tbl` files from `ssb-dbgen` (e.g. build [vadimtk/ssb-dbgen](https://github.com/vadimtk/ssb-dbgen),
 //! then `./dbgen -s <SF> -T a` in the output directory). Files: `customer.tbl`, `part.tbl`, `supplier.tbl`,
-//! `date.tbl`, `lineorder.tbl`. Those files are read once into in-memory tables (like TPC-H), then timed queries run without re-reading disk.
+//! `date.tbl`, `lineorder.tbl`. Comma-separated with a trailing empty field, as from typical `ssb-dbgen`.
+//! Files are read once into in-memory tables (like TPC-H), then timed queries run without re-reading disk.
 
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{Parser, Subcommand};
 use datafusion::common::Result;
 use datafusion::execution::SessionStateBuilder;
 use datafusion::prelude::*;
@@ -64,15 +65,6 @@ struct TpchCmd {
     queries: Option<Vec<usize>>,
 }
 
-#[derive(Clone, Copy, Default, ValueEnum)]
-enum SsbFileFormat {
-    /// Comma-separated `.tbl` with `YYYY-MM-DD` dates in lineorder (typical open-source dbgen)
-    #[default]
-    Comma,
-    /// Pipe-separated `.tbl` with integer `lo_orderdate` / `lo_commitdate` (no trailing empty field)
-    Pipe,
-}
-
 #[derive(Parser)]
 struct SsbCmd {
     #[command(flatten)]
@@ -81,10 +73,6 @@ struct SsbCmd {
     /// Directory containing `customer.tbl`, `part.tbl`, `supplier.tbl`, `date.tbl`, `lineorder.tbl`
     #[arg(long)]
     data_dir: PathBuf,
-
-    /// File layout for `.tbl` rows
-    #[arg(long, value_enum, default_value_t = SsbFileFormat::Comma)]
-    format: SsbFileFormat,
 
     /// Comma-separated query ids (e.g. "1.1,2.1,3.4"). Defaults to all 13.
     #[arg(long, value_delimiter = ',')]
@@ -187,11 +175,6 @@ async fn run_tpch(cmd: TpchCmd) -> Result<()> {
 }
 
 async fn run_ssb(cmd: SsbCmd) -> Result<()> {
-    let load_opts = match cmd.format {
-        SsbFileFormat::Comma => load::SsbLoadOptions::comma_dbgen(),
-        SsbFileFormat::Pipe => load::SsbLoadOptions::pipe_integral_dates(),
-    };
-
     let query_ids: Vec<String> = cmd
         .queries
         .unwrap_or_else(|| ssb_queries::QUERY_IDS.iter().map(|s| (*s).to_string()).collect());
@@ -201,7 +184,7 @@ async fn run_ssb(cmd: SsbCmd) -> Result<()> {
         cmd.data_dir.display()
     );
     let ctx = session_with_lip(cmd.common.lip, cmd.common.lip_fp_rate);
-    load::register_ssb_tables(&ctx, &cmd.data_dir, load_opts).await?;
+    load::register_ssb_tables(&ctx, &cmd.data_dir).await?;
     println!(
         "Data ready (LIP {}).\n",
         if cmd.common.lip {

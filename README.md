@@ -42,20 +42,19 @@ cargo run --release --bin benchmark -- tpch --scale-factor 0.1 --queries 1,6 --i
 
 ### Star Schema Benchmark (`ssb`)
 
-Generate tables with `ssb-dbgen` (example: `./dbgen -s 1 -T a`), then point `--data-dir` at the directory containing `customer.tbl`, `part.tbl`, `supplier.tbl`, `date.tbl`, and `lineorder.tbl`. Files are read once into DataFusion `MemTable`s (same pattern as in-memory TPC-H), then queries run without further disk I/O for those tables.
+Generate tables with `ssb-dbgen` (example: `./dbgen -s 1 -T a`), then point `--data-dir` at the directory containing `customer.tbl`, `part.tbl`, `supplier.tbl`, `date.tbl`, and `lineorder.tbl`. The loader expects **comma-separated** rows with a **trailing empty field**, as produced by typical dbgen output. Files are read once into DataFusion `MemTable`s (same pattern as in-memory TPC-H), then queries run without further disk I/O for those tables.
 
 ```bash
-# All 13 queries (1.1 … 4.3); comma-separated `.tbl` with ISO dates (default)
+# All 13 queries (1.1 … 4.3)
 cargo run --release --bin benchmark -- ssb --data-dir /path/to/ssb-data
 
-# Subset of queries; pipe-delimited files with integer date keys
-cargo run --release --bin benchmark -- ssb --data-dir /path/to/ssb-data --format pipe --queries 1.1,2.1,3.4
+# Subset of queries
+cargo run --release --bin benchmark -- ssb --data-dir /path/to/ssb-data --queries 1.1,2.1,3.4
 ```
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--data-dir` | (required) | Directory of `.tbl` files |
-| `--format` | `comma` | `comma` (typical dbgen: `YYYY-MM-DD` in lineorder) or `pipe` (integral dates, no trailing field) |
+| `--data-dir` | (required) | Directory of comma-separated `.tbl` files (trailing empty column) |
 | `--queries` | all | Comma-separated ids: `1.1`, `2.3`, … |
 | `--iterations` | `1` | Runs per query; best time reported |
 | `--lip` / `--lip-fp-rate` | | Same as TPC-H |
