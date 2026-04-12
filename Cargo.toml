@@ -1,0 +1,24 @@
+[package]
+name = "lip-datafusion"
+version = "0.1.0"
+edition = "2021"
+description = "Lookahead Information Passing (LIP) for robust query plans, implemented on Apache DataFusion"
+
+[lib]
+name = "lip_datafusion"
+path = "src/lib.rs"
+
+[[bin]]
+name = "benchmark"
+path = "src/bin/benchmark.rs"
+
+[dependencies]
+datafusion = "53"
+tokio = { version = "1", features = ["full"] }
+futures = "0.3"
+clap = { version = "4", features = ["derive"] }
+log = "0.4"
+env_logger = "0.11"
+rand = { version = "0.8", features = ["small_rng"] }
+tpchgen = "2"
+bloom = "0.3.2"
