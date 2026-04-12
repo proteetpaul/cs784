@@ -174,13 +174,14 @@ impl LIPOptimizerRule {
         while current.as_any().is::<HashJoinExec>() {
             let hj = current.as_any().downcast_ref::<HashJoinExec>().unwrap();
             let left = self.transform_plan(hj.left())?;
-            let key_column = Self::build_key_column(hj);
+            let build_key_column = Self::build_key_column(hj);
+            let probe_key_column = Self::probe_key_column(hj);
             let expected_rows = Self::estimate_rows(&left);
-            let filter = Filter::new(key_column.name().to_string(), self.bloom_fp_rate, expected_rows);
+            let filter = Filter::new(probe_key_column.name().to_string(), self.bloom_fp_rate, expected_rows);
 
             let wrapped_left: Arc<dyn ExecutionPlan> = Arc::new(LipBuildExec::new(
                 left,
-                key_column,
+                build_key_column,
                 &filter.bloom,
             ));
             filters.push(filter);
@@ -208,6 +209,17 @@ impl LIPOptimizerRule {
     fn build_key_column(hj: &HashJoinExec) -> Column {
         hj.on()[0]
             .0
+            .as_any()
+            .downcast_ref::<Column>()
+            .expect("build-side join key should be a Column expression")
+            .clone()
+    }
+
+    /// Extract the probe-side join-key column index from the first
+    /// equijoin condition of a `HashJoinExec`.
+    fn probe_key_column(hj: &HashJoinExec) -> Column {
+        hj.on()[0]
+            .1
             .as_any()
             .downcast_ref::<Column>()
             .expect("build-side join key should be a Column expression")
