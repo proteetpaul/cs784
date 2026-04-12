@@ -1,8 +1,12 @@
-//! Register SSB tables from `ssb-dbgen` `.tbl` files via DataFusion CSV listing.
+//! Load SSB `.tbl` files into in-memory [`MemTable`]s (same pattern as TPC-H [`crate::tpch::datagen`]).
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
+use datafusion::arrow::datatypes::Schema;
+use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::{DataFusionError, Result};
+use datafusion::datasource::MemTable;
 use datafusion::prelude::{CsvReadOptions, SessionContext};
 
 use super::schema::{
@@ -65,7 +69,43 @@ fn path_to_str(p: &Path) -> Result<&str> {
         .ok_or_else(|| DataFusionError::Execution(format!("non-UTF8 path: {}", p.display())))
 }
 
-/// Register SSB dimension tables and `lineorder` on `ctx` from `data_dir`.
+fn csv_opts(delimiter: u8, schema: &Schema) -> CsvReadOptions<'_> {
+    CsvReadOptions::new()
+        .has_header(false)
+        .delimiter(delimiter)
+        .file_extension(".tbl")
+        .schema(schema)
+}
+
+/// Read one `.tbl` file and collect all batches (full file read into memory).
+async fn read_tbl_batches(
+    ctx: &SessionContext,
+    path: &str,
+    delimiter: u8,
+    schema: &Schema,
+) -> Result<Vec<RecordBatch>> {
+    let df = ctx.read_csv(path, csv_opts(delimiter, schema)).await?;
+    df.collect().await
+}
+
+/// Register a [`MemTable`] like [`crate::tpch::datagen`] (`vec![batches]` = one partition).
+fn register_mem(
+    ctx: &SessionContext,
+    name: &str,
+    table_schema: Arc<Schema>,
+    batches: Vec<RecordBatch>,
+) -> Result<()> {
+    let schema = if let Some(b) = batches.first() {
+        b.schema()
+    } else {
+        table_schema
+    };
+    let partitions = vec![batches];
+    ctx.register_table(name, Arc::new(MemTable::try_new(schema, partitions)?))?;
+    Ok(())
+}
+
+/// Load SSB `.tbl` files into memory and register tables on `ctx` (same idea as TPC-H mem tables).
 ///
 /// Expects `customer.tbl`, `part.tbl`, `supplier.tbl`, `date.tbl`, and `lineorder.tbl`.
 /// The date dimension is registered as **`dates`** to match standard SSB query SQL.
@@ -83,45 +123,37 @@ pub async fn register_ssb_tables(
     let date = require_file(data_dir, "date.tbl")?;
     let lineorder = require_file(data_dir, "lineorder.tbl")?;
 
-    let base_csv = || {
-        CsvReadOptions::new()
-            .has_header(false)
-            .delimiter(delim)
-            .file_extension(".tbl")
-    };
-
     let cust_schema = customer_schema(trail);
-    ctx.register_csv(
+    let cust_batches = read_tbl_batches(ctx, path_to_str(&customer)?, delim, &cust_schema).await?;
+    register_mem(
+        ctx,
         "customer",
-        path_to_str(&customer)?,
-        base_csv().schema(&cust_schema),
-    )
-    .await?;
+        Arc::new(cust_schema),
+        cust_batches,
+    )?;
 
     let part_schema = part_schema(trail);
-    ctx.register_csv("part", path_to_str(&part)?, base_csv().schema(&part_schema))
-        .await?;
+    let part_batches = read_tbl_batches(ctx, path_to_str(&part)?, delim, &part_schema).await?;
+    register_mem(ctx, "part", Arc::new(part_schema), part_batches)?;
 
     let sup_schema = supplier_schema(trail);
-    ctx.register_csv(
-        "supplier",
-        path_to_str(&supplier)?,
-        base_csv().schema(&sup_schema),
-    )
-    .await?;
+    let sup_batches = read_tbl_batches(ctx, path_to_str(&supplier)?, delim, &sup_schema).await?;
+    register_mem(ctx, "supplier", Arc::new(sup_schema), sup_batches)?;
 
     let dates_s = dates_schema(trail);
-    ctx.register_csv("dates", path_to_str(&date)?, base_csv().schema(&dates_s))
-        .await?;
+    let date_batches = read_tbl_batches(ctx, path_to_str(&date)?, delim, &dates_s).await?;
+    register_mem(ctx, "dates", Arc::new(dates_s), date_batches)?;
 
     if options.lineorder_date_strings {
         let lo_schema = lineorder_raw_schema_string_dates(trail);
-        ctx.register_csv(
+        let lo_batches =
+            read_tbl_batches(ctx, path_to_str(&lineorder)?, delim, &lo_schema).await?;
+        register_mem(
+            ctx,
             "lineorder_raw",
-            path_to_str(&lineorder)?,
-            base_csv().schema(&lo_schema),
-        )
-        .await?;
+            Arc::new(lo_schema),
+            lo_batches,
+        )?;
 
         let view_sql = r#"
 CREATE OR REPLACE VIEW lineorder AS
@@ -148,12 +180,9 @@ FROM lineorder_raw
         ctx.sql(view_sql).await?.collect().await?;
     } else {
         let lo_schema = lineorder_raw_schema_integral_dates(trail);
-        ctx.register_csv(
-            "lineorder",
-            path_to_str(&lineorder)?,
-            base_csv().schema(&lo_schema),
-        )
-        .await?;
+        let lo_batches =
+            read_tbl_batches(ctx, path_to_str(&lineorder)?, delim, &lo_schema).await?;
+        register_mem(ctx, "lineorder", Arc::new(lo_schema), lo_batches)?;
     }
 
     Ok(())

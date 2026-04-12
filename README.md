@@ -42,7 +42,7 @@ cargo run --release --bin benchmark -- tpch --scale-factor 0.1 --queries 1,6 --i
 
 ### Star Schema Benchmark (`ssb`)
 
-Generate tables with `ssb-dbgen` (example: `./dbgen -s 1 -T a`), then point `--data-dir` at the directory containing `customer.tbl`, `part.tbl`, `supplier.tbl`, `date.tbl`, and `lineorder.tbl`.
+Generate tables with `ssb-dbgen` (example: `./dbgen -s 1 -T a`), then point `--data-dir` at the directory containing `customer.tbl`, `part.tbl`, `supplier.tbl`, `date.tbl`, and `lineorder.tbl`. Files are read once into DataFusion `MemTable`s (same pattern as in-memory TPC-H), then queries run without further disk I/O for those tables.
 
 ```bash
 # All 13 queries (1.1 … 4.3); comma-separated `.tbl` with ISO dates (default)
@@ -74,7 +74,7 @@ src/
   optimizer_rule.rs      (stub) PhysicalOptimizerRule to inject LIP
   ssb/
     schema.rs            Arrow schemas for SSB `.tbl` columns
-    load.rs              Register tables + lineorder date view
+    load.rs              Read `.tbl` into MemTable + lineorder date view
     queries.rs           13 standard SSB SQL queries
   tpch/
     schema.rs            Arrow schemas for all 8 TPC-H tables

@@ -2,7 +2,7 @@
 //!
 //! SSB expects `.tbl` files from `ssb-dbgen` (e.g. build [vadimtk/ssb-dbgen](https://github.com/vadimtk/ssb-dbgen),
 //! then `./dbgen -s <SF> -T a` in the output directory). Files: `customer.tbl`, `part.tbl`, `supplier.tbl`,
-//! `date.tbl`, `lineorder.tbl`.
+//! `date.tbl`, `lineorder.tbl`. Those files are read once into in-memory tables (like TPC-H), then timed queries run without re-reading disk.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -196,7 +196,10 @@ async fn run_ssb(cmd: SsbCmd) -> Result<()> {
         .queries
         .unwrap_or_else(|| ssb_queries::QUERY_IDS.iter().map(|s| (*s).to_string()).collect());
 
-    println!("Loading SSB tables from {} ...", cmd.data_dir.display());
+    println!(
+        "Reading SSB .tbl files from {} into memory ...",
+        cmd.data_dir.display()
+    );
     let ctx = session_with_lip(cmd.common.lip, cmd.common.lip_fp_rate);
     load::register_ssb_tables(&ctx, &cmd.data_dir, load_opts).await?;
     println!(
