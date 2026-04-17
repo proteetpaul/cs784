@@ -7,11 +7,12 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use clap::{Parser, Subcommand};
-use datafusion::common::Result;
+use datafusion::common::{Result, exec_err};
 use datafusion::execution::SessionStateBuilder;
+use datafusion::physical_plan::displayable;
 use datafusion::prelude::*;
 
 use lip_datafusion::optimizer_rule::LIPOptimizerRule;
@@ -38,8 +39,8 @@ enum Commands {
 
 #[derive(Parser)]
 struct SharedBenchArgs {
-    /// Number of times to repeat each query (best-of-N reported)
-    #[arg(long, default_value = "1")]
+    /// Number of times to repeat each query (mean wall time reported)
+    #[arg(long, default_value = "5")]
     iterations: usize,
 
     /// Enable lookahead information passing (Bloom filters on right-deep hash-join chains)
@@ -49,6 +50,10 @@ struct SharedBenchArgs {
     /// Bloom false-positive rate when `--lip` is set (typical range: 0.001–0.05)
     #[arg(long, default_value_t = 0.01)]
     lip_fp_rate: f32,
+
+    /// Print the optimized physical plan for each query once before timed runs
+    #[arg(long, default_value_t = false)]
+    explain_physical: bool,
 }
 
 #[derive(Parser)]
@@ -91,6 +96,14 @@ fn session_with_lip(lip: bool, lip_fp_rate: f32) -> SessionContext {
     }
 }
 
+fn mean_wall_ms(timings: &[Duration]) -> f64 {
+    let n = timings.len() as f64;
+    if n == 0.0 {
+        return 0.0;
+    }
+    timings.iter().map(|d| d.as_secs_f64()).sum::<f64>() * 1000.0 / n
+}
+
 async fn run_query(ctx: &SessionContext, sql: &str) -> Result<(usize, std::time::Duration)> {
     let df = ctx.sql(sql).await?;
     let start = Instant::now();
@@ -98,6 +111,17 @@ async fn run_query(ctx: &SessionContext, sql: &str) -> Result<(usize, std::time:
     let elapsed = start.elapsed();
     let row_count: usize = batches.iter().map(|b| b.num_rows()).sum();
     Ok((row_count, elapsed))
+}
+
+/// Build the optimized physical plan and print it (does not execute the query).
+async fn print_physical_plan(ctx: &SessionContext, sql: &str, label: &str) -> Result<()> {
+    let df = ctx.sql(sql).await?;
+    let plan = df.create_physical_plan().await?;
+    log::info!(
+        "--- Physical plan: {label} ---\n{}",
+        displayable(plan.as_ref()).indent(true)
+    );
+    Ok(())
 }
 
 #[tokio::main]
@@ -112,6 +136,9 @@ async fn main() -> Result<()> {
 }
 
 async fn run_tpch(cmd: TpchCmd) -> Result<()> {
+    if cmd.common.iterations == 0 {
+        return exec_err!("--iterations must be at least 1");
+    }
     let query_nums: Vec<usize> = cmd.queries.unwrap_or_else(|| (1..=22).collect());
 
     println!("Generating TPC-H data (SF={}) ...", cmd.scale_factor);
@@ -126,7 +153,7 @@ async fn run_tpch(cmd: TpchCmd) -> Result<()> {
         }
     );
 
-    println!("{:<8} {:>10} {:>12}", "Query", "Rows", "Time (ms)");
+    println!("{:<8} {:>10} {:>12}", "Query", "Rows", "Avg (ms)");
     println!("{}", "-".repeat(32));
 
     for &q in &query_nums {
@@ -142,31 +169,33 @@ async fn run_tpch(cmd: TpchCmd) -> Result<()> {
             }
         };
 
-        let mut best_elapsed = std::time::Duration::MAX;
+        if cmd.common.explain_physical {
+            print_physical_plan(&ctx, &sql, &format!("TPC-H Q{q}")).await?;
+        }
+
+        let mut timings = Vec::with_capacity(cmd.common.iterations);
         let mut row_count = 0;
 
         for _ in 0..cmd.common.iterations {
             match run_query(&ctx, &sql).await {
                 Ok((rows, elapsed)) => {
                     row_count = rows;
-                    if elapsed < best_elapsed {
-                        best_elapsed = elapsed;
-                    }
+                    timings.push(elapsed);
                 }
                 Err(e) => {
                     eprintln!("Q{q:<3} ERROR: {e}");
-                    best_elapsed = std::time::Duration::ZERO;
+                    timings.clear();
                     break;
                 }
             }
         }
 
-        if best_elapsed != std::time::Duration::ZERO {
+        if timings.len() == cmd.common.iterations {
             println!(
                 "Q{:<7} {:>10} {:>12.2}",
                 q,
                 row_count,
-                best_elapsed.as_secs_f64() * 1000.0
+                mean_wall_ms(&timings)
             );
         }
     }
@@ -175,17 +204,20 @@ async fn run_tpch(cmd: TpchCmd) -> Result<()> {
 }
 
 async fn run_ssb(cmd: SsbCmd) -> Result<()> {
+    if cmd.common.iterations == 0 {
+        return exec_err!("--iterations must be at least 1");
+    }
     let query_ids: Vec<String> = cmd
         .queries
         .unwrap_or_else(|| ssb_queries::QUERY_IDS.iter().map(|s| (*s).to_string()).collect());
 
-    println!(
+    log::info!(
         "Reading SSB .tbl files from {} into memory ...",
         cmd.data_dir.display()
     );
     let ctx = session_with_lip(cmd.common.lip, cmd.common.lip_fp_rate);
     load::register_ssb_tables(&ctx, &cmd.data_dir).await?;
-    println!(
+    log::info!(
         "Data ready (LIP {}).\n",
         if cmd.common.lip {
             format!("on, fp_rate={}", cmd.common.lip_fp_rate)
@@ -194,43 +226,45 @@ async fn run_ssb(cmd: SsbCmd) -> Result<()> {
         }
     );
 
-    println!("{:<8} {:>10} {:>12}", "Query", "Rows", "Time (ms)");
-    println!("{}", "-".repeat(32));
+    log::info!("{:<8} {:>10} {:>12}", "Query", "Rows", "Avg (ms)");
+    log::info!("{}", "-".repeat(32));
 
     for qid in &query_ids {
         let sql = match ssb_queries::get_query(qid) {
             Some(s) => s,
             None => {
-                eprintln!("Q{qid} ERROR: unknown query id (use e.g. 1.1, 2.3)");
+                log::error!("Q{qid} ERROR: unknown query id (use e.g. 1.1, 2.3)");
                 continue;
             }
         };
 
-        let mut best_elapsed = std::time::Duration::MAX;
+        if cmd.common.explain_physical {
+            print_physical_plan(&ctx, sql, &format!("SSB {qid}")).await?;
+        }
+
+        let mut timings = Vec::with_capacity(cmd.common.iterations);
         let mut row_count = 0;
 
         for _ in 0..cmd.common.iterations {
             match run_query(&ctx, sql).await {
                 Ok((rows, elapsed)) => {
                     row_count = rows;
-                    if elapsed < best_elapsed {
-                        best_elapsed = elapsed;
-                    }
+                    timings.push(elapsed);
                 }
                 Err(e) => {
-                    eprintln!("Q{qid} ERROR: {e}");
-                    best_elapsed = std::time::Duration::ZERO;
+                    log::error!("Q{qid} ERROR: {e}");
+                    timings.clear();
                     break;
                 }
             }
         }
 
-        if best_elapsed != std::time::Duration::ZERO {
-            println!(
+        if timings.len() == cmd.common.iterations {
+            log::info!(
                 "Q{:<7} {:>10} {:>12.2}",
                 qid,
                 row_count,
-                best_elapsed.as_secs_f64() * 1000.0
+                mean_wall_ms(&timings)
             );
         }
     }

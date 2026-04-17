@@ -28,15 +28,16 @@ cargo run --release --bin benchmark -- tpch
 # Run specific queries at a larger scale factor
 cargo run --release --bin benchmark -- tpch --scale-factor 0.1 --queries 1,3,5,6,8,12
 
-# Repeat each query 3 times and report best-of-3
-cargo run --release --bin benchmark -- tpch --scale-factor 0.1 --queries 1,6 --iterations 3
+# Repeat each query 10 times and report mean time (default is 5 iterations)
+cargo run --release --bin benchmark -- tpch --scale-factor 0.1 --queries 1,6 --iterations 10
 ```
 
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--scale-factor` | `0.01` | TPC-H scale factor (1.0 ≈ 6 M lineitem rows) |
 | `--queries` | all | Comma-separated query numbers (1-22) |
-| `--iterations` | `1` | Runs per query; best time reported |
+| `--iterations` | `5` | Runs per query; mean wall time reported |
+| `--explain-physical` | off | Print optimized physical plan per query before timed runs |
 | `--lip` | off | Enable LIP optimizer rule |
 | `--lip-fp-rate` | `0.01` | Bloom false-positive rate when `--lip` is set |
 
@@ -56,7 +57,8 @@ cargo run --release --bin benchmark -- ssb --data-dir /path/to/ssb-data --querie
 |------|---------|-------------|
 | `--data-dir` | (required) | Directory of comma-separated `.tbl` files (trailing empty column) |
 | `--queries` | all | Comma-separated ids: `1.1`, `2.3`, … |
-| `--iterations` | `1` | Runs per query; best time reported |
+| `--iterations` | `5` | Runs per query; mean wall time reported |
+| `--explain-physical` | off | Same as TPC-H |
 | `--lip` / `--lip-fp-rate` | | Same as TPC-H |
 
 Optional: set `SSB_DATA_DIR` when running `cargo test` to exercise a quick SSB load + Q1.1.

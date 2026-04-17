@@ -12,6 +12,10 @@ path = "src/lib.rs"
 name = "benchmark"
 path = "src/bin/benchmark.rs"
 
+[[bin]]
+name = "benchmark_orders"
+path = "src/bin/benchmark_orders.rs"
+
 [dependencies]
 datafusion = "53"
 tokio = { version = "1", features = ["full"] }
