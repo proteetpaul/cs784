@@ -142,7 +142,8 @@ impl LipFilterStream {
             loc += batch_size;
             batch_size *= 2;
         }
-        filter_record_batch(batch, &result_indexes)
+        let res = filter_record_batch(batch, &result_indexes);
+        res
     }
 }
 

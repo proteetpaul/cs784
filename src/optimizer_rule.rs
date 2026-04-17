@@ -3,6 +3,7 @@ use std::sync::Arc;
 use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
 use datafusion::physical_expr::expressions::Column;
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
+use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::joins::HashJoinExec;
 
@@ -179,11 +180,19 @@ impl LIPOptimizerRule {
             let expected_rows = Self::estimate_rows(&left);
             let filter = Filter::new(probe_key_column.name().to_string(), self.bloom_fp_rate, expected_rows);
 
-            let wrapped_left: Arc<dyn ExecutionPlan> = Arc::new(LipBuildExec::new(
-                left,
-                build_key_column,
-                &filter.bloom,
-            ));
+            let wrapped_left: Arc<dyn ExecutionPlan> =
+                if let Some(coalesce) = left.as_any().downcast_ref::<CoalescePartitionsExec>() {
+                    // If the immediate left child is a CoalescePartitionExec node, it will prevent us from parallelizing the creation of
+                    // the bloom filter. So we push the LipBuildExec below this node.
+                    let lip_inner = Arc::new(LipBuildExec::new(
+                        Arc::clone(coalesce.input()),
+                        build_key_column.clone(),
+                        &filter.bloom,
+                    ));
+                    Arc::clone(&left).with_new_children(vec![lip_inner])?
+                } else {
+                    Arc::new(LipBuildExec::new(left, build_key_column, &filter.bloom))
+                };
             filters.push(filter);
             left_children.push(wrapped_left);
 
