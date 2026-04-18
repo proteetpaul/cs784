@@ -218,18 +218,29 @@ impl LIPOptimizerRule {
         }
 
         let mut right_child = self.transform_plan(&current)?;
-        right_child = Arc::new(LipFilterExec::new(&right_child, filters))
-            .with_new_children(vec![right_child])?;
+        let mut lip_filters = Some(filters);
 
-        // Rebuild the chain bottom-up: each join gets its own wrapped build side from `left_children`.
-        for ((join_plan, wrapped_left), spine) in joins
+        // Rebuild bottom-up (innermost join first). Apply each join's projection spine before
+        // attaching the next operator so keys match the hash join: blooms are built from
+        // dimension key types (e.g. Int32 `d_datekey`) and must probe the same representation
+        // on the fact side (e.g. Int32 `lo_orderdate` after CAST), not raw `lineorder_raw`
+        // Date32 values below the spine.
+        for (depth, ((join_plan, wrapped_left), spine)) in joins
             .iter()
             .rev()
             .zip(left_children.iter().rev())
             .zip(projection_spines.iter().rev())
+            .enumerate()
         {
-            for p in spine {
+            for p in spine.iter().rev() {
                 right_child = Arc::clone(p).with_new_children(vec![right_child])?;
+            }
+            if depth == 0 {
+                right_child = Arc::new(LipFilterExec::new(
+                    &right_child,
+                    lip_filters.take().expect("LIP filters set once"),
+                ))
+                .with_new_children(vec![right_child])?;
             }
             right_child = Arc::clone(join_plan)
                 .with_new_children(vec![Arc::clone(wrapped_left), right_child])?;
