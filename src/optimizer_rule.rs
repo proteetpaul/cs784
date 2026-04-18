@@ -6,6 +6,7 @@ use datafusion::physical_optimizer::PhysicalOptimizerRule;
 use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::joins::HashJoinExec;
+use datafusion::physical_plan::projection::ProjectionExec;
 
 use crate::lip_build_exec::{Filter, LipBuildExec};
 use crate::lip_filter_exec::LipFilterExec;
@@ -84,7 +85,8 @@ impl LIPOptimizerRule {
             }
 
             build_sides.push(left);
-            current = right;
+            let (_, right_inner) = Self::peel_projection_spine(right);
+            current = right_inner;
         }
 
         if build_sides.is_empty() {
@@ -140,6 +142,18 @@ impl LIPOptimizerRule {
         found_join
     }
 
+    /// Strips a prefix of consecutive `ProjectionExec` nodes (outermost first).
+    fn peel_projection_spine(
+        mut plan: Arc<dyn ExecutionPlan>,
+    ) -> (Vec<Arc<dyn ExecutionPlan>>, Arc<dyn ExecutionPlan>) {
+        let mut spine: Vec<Arc<dyn ExecutionPlan>> = Vec::new();
+        while let Some(proj) = plan.as_any().downcast_ref::<ProjectionExec>() {
+            spine.push(Arc::clone(&plan));
+            plan = Arc::clone(proj.input());
+        }
+        (spine, plan)
+    }
+
     /// Recursively walk the plan tree.  When a right-deep HashJoinExec
     /// chain is found, wrap every build-side (left) input with a
     /// `LipBuildExec` that populates a Bloom filter on the join key.
@@ -169,6 +183,7 @@ impl LIPOptimizerRule {
         let mut joins: Vec<Arc<dyn ExecutionPlan>> = Vec::new();
         let mut current = Arc::clone(plan);
         let mut left_children: Vec<Arc<dyn ExecutionPlan>> = Vec::new();
+        let mut projection_spines: Vec<Vec<Arc<dyn ExecutionPlan>>> = Vec::new();
         let mut filters = Vec::<Filter>::new();
 
         // Traverse to the probe-side table
@@ -197,7 +212,9 @@ impl LIPOptimizerRule {
             left_children.push(wrapped_left);
 
             joins.push(Arc::clone(&current));
-            current = Arc::clone(hj.right());
+            let (spine, right_inner) = Self::peel_projection_spine(Arc::clone(hj.right()));
+            projection_spines.push(spine);
+            current = right_inner;
         }
 
         let mut right_child = self.transform_plan(&current)?;
@@ -205,7 +222,15 @@ impl LIPOptimizerRule {
             .with_new_children(vec![right_child])?;
 
         // Rebuild the chain bottom-up: each join gets its own wrapped build side from `left_children`.
-        for (join_plan, wrapped_left) in joins.iter().rev().zip(left_children.iter().rev()) {
+        for ((join_plan, wrapped_left), spine) in joins
+            .iter()
+            .rev()
+            .zip(left_children.iter().rev())
+            .zip(projection_spines.iter().rev())
+        {
+            for p in spine {
+                right_child = Arc::clone(p).with_new_children(vec![right_child])?;
+            }
             right_child = Arc::clone(join_plan)
                 .with_new_children(vec![Arc::clone(wrapped_left), right_child])?;
         }
