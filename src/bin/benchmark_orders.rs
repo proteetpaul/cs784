@@ -1,19 +1,28 @@
-//! SSB join-order micro-benchmark: run Q3.1–Q3.3 for each left-deep permutation of
-//! dimensions after `lineorder` (`3! = 6` plans per query).
+//! SSB join-order micro-benchmark: run Q3.1–Q3.3 for each of the `3!` dimension permutations.
+//! Each join uses the dimension table on the **left** and the growing subtree on the right.
 
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use clap::Parser;
+use datafusion::common::config::ConfigOptions;
+use datafusion::common::tree_node::{
+    Transformed, TransformedResult, TreeNode,
+};
 use datafusion::common::{Result, exec_err};
 use datafusion::dataframe::DataFrame;
 use datafusion::execution::session_state::SessionStateBuilder;
 use datafusion::logical_expr::LogicalPlan;
+use datafusion::physical_optimizer::optimizer::PhysicalOptimizer;
+use datafusion::physical_optimizer::PhysicalOptimizerRule;
 use datafusion::physical_plan::displayable;
+use datafusion::physical_plan::joins::{HashJoinExec, PartitionMode};
+use datafusion::physical_plan::ExecutionPlan;
 use datafusion::prelude::SessionContext;
 
 use lip_datafusion::optimizer_rule::LIPOptimizerRule;
+use lip_datafusion::ssb::coerce_join_order::CoerceSsbHashJoinBuildSide;
 use lip_datafusion::ssb::join_order_q3::{
     self, DIMENSION_JOIN_PERMUTATIONS, Q3Query, format_dim_order,
 };
@@ -22,7 +31,7 @@ use lip_datafusion::ssb::load;
 #[derive(Parser)]
 #[command(
     name = "benchmark_orders",
-    about = "SSB Q3.1–Q3.3: time each left-deep join order (dimension permutations) with optional LIP"
+    about = "SSB Q3.1–Q3.3: time each dimension permutation join plan (dim on left) with optional LIP"
 )]
 struct Cli {
     /// Directory containing `customer.tbl`, `part.tbl`, `supplier.tbl`, `date.tbl`, `lineorder.tbl`
@@ -49,11 +58,70 @@ struct Cli {
     explain_physical: bool,
 }
 
+/// Replaces DataFusion's `JoinSelection` for this benchmark: `JoinSelection` resolves
+/// `PartitionMode::Auto` (required before execute) but also swaps join sides from statistics.
+/// We only perform the `Auto` → `Partitioned` step so plans stay runnable without reordering children.
+#[derive(Debug)]
+struct ResolveHashJoinAutoMode;
+
+impl PhysicalOptimizerRule for ResolveHashJoinAutoMode {
+    fn optimize(
+        &self,
+        plan: Arc<dyn ExecutionPlan>,
+        _config: &ConfigOptions,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        plan.transform_up(|node| {
+            if let Some(hj) = node.as_any().downcast_ref::<HashJoinExec>() {
+                if *hj.partition_mode() == PartitionMode::Auto {
+                    let rebuilt = hj
+                        .builder()
+                        .with_partition_mode(PartitionMode::CollectLeft)
+                        .build_exec()?;
+                    return Ok(Transformed::yes(rebuilt));
+                }
+            }
+            Ok(Transformed::no(node))
+        })
+        .data()
+    }
+
+    fn name(&self) -> &str {
+        "resolve_hash_join_auto_mode"
+    }
+
+    fn schema_check(&self) -> bool {
+        true
+    }
+}
+
 fn build_session(lip: bool, lip_fp_rate: f32) -> SessionContext {
-    // DataFusion 53 removed `join_reordering` from optimizer config keys (`set_bool` panics).
-    // Join order in this benchmark is explicit in the logical plan; physical join side choice
-    // may still follow `JoinSelection` heuristics.
-    let mut builder = SessionStateBuilder::new_with_default_features();
+    // Swap out `join_selection` only: keep all other default physical rules.
+    let default_phys = PhysicalOptimizer::new();
+    let rules: Vec<_> = default_phys
+        .rules
+        .into_iter()
+        .map(|rule| {
+            if rule.name() == "join_selection" {
+                Arc::new(ResolveHashJoinAutoMode) as Arc<dyn PhysicalOptimizerRule + Send + Sync>
+            } else {
+                rule
+            }
+        })
+        .collect();
+
+    let coerce: Arc<dyn PhysicalOptimizerRule + Send + Sync> =
+        Arc::new(CoerceSsbHashJoinBuildSide::default());
+    let mut rules_with_coerce = Vec::with_capacity(rules.len() + 1);
+    for rule in rules {
+        if rule.name() == "EnforceDistribution" {
+            rules_with_coerce.push(Arc::clone(&coerce));
+        }
+        rules_with_coerce.push(rule);
+    }
+
+    let mut builder = SessionStateBuilder::new()
+        .with_physical_optimizer_rules(rules_with_coerce)
+        .with_default_features();
 
     if lip {
         builder = builder.with_physical_optimizer_rule(Arc::new(LIPOptimizerRule::new(
@@ -129,7 +197,7 @@ async fn main() -> Result<()> {
     load::register_ssb_tables(&ctx, &cli.data_dir).await?;
 
     log::info!(
-        "join_orders={} per query (left-deep: lineorder then dimension permutation)",
+        "join_orders={} per query (dimension on left of each join; permutation = join order)",
         DIMENSION_JOIN_PERMUTATIONS.len()
     );
     log::info!(
