@@ -19,7 +19,7 @@ use datafusion::physical_optimizer::PhysicalOptimizerRule;
 use datafusion::physical_plan::displayable;
 use datafusion::physical_plan::joins::{HashJoinExec, PartitionMode};
 use datafusion::physical_plan::ExecutionPlan;
-use datafusion::prelude::SessionContext;
+use datafusion::prelude::{SessionConfig, SessionContext};
 
 use lip_datafusion::optimizer_rule::LIPOptimizerRule;
 use lip_datafusion::ssb::coerce_join_order::CoerceSsbHashJoinBuildSide;
@@ -119,7 +119,18 @@ fn build_session(lip: bool, lip_fp_rate: f32) -> SessionContext {
         rules_with_coerce.push(rule);
     }
 
+    let mut session_config = SessionConfig::new();
+    if lip {
+        // LIP already injects Bloom semi-join style filtering; disable DataFusion join/topk/aggregate
+        // dynamic filter pushdown to avoid stacking two mechanisms on the same plans.
+        session_config = session_config.set_bool(
+            "datafusion.optimizer.enable_dynamic_filter_pushdown",
+            false,
+        );
+    }
+
     let mut builder = SessionStateBuilder::new()
+        .with_config(session_config)
         .with_physical_optimizer_rules(rules_with_coerce)
         .with_default_features();
 

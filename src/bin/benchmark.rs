@@ -86,7 +86,12 @@ struct SsbCmd {
 
 fn session_with_lip(lip: bool, lip_fp_rate: f32) -> SessionContext {
     if lip {
+        let session_config = SessionConfig::new().set_bool(
+            "datafusion.optimizer.enable_dynamic_filter_pushdown",
+            false,
+        );
         let state = SessionStateBuilder::new()
+            .with_config(session_config)
             .with_default_features()
             .with_physical_optimizer_rule(Arc::new(LIPOptimizerRule::new(lip_fp_rate)))
             .build();
