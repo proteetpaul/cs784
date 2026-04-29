@@ -17,6 +17,7 @@ use datafusion::execution::session_state::SessionStateBuilder;
 use datafusion::logical_expr::LogicalPlan;
 use datafusion::physical_optimizer::optimizer::PhysicalOptimizer;
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
+use datafusion::physical_plan::display::DisplayableExecutionPlan;
 use datafusion::physical_plan::displayable;
 use datafusion::physical_plan::joins::{HashJoinExec, PartitionMode};
 use datafusion::physical_plan::ExecutionPlan;
@@ -236,6 +237,13 @@ async fn print_physical_plan_logical(
     Ok(())
 }
 
+fn print_physical_plan_with_metrics(plan: &dyn ExecutionPlan, label: &str) {
+    log::info!(
+        "--- Physical plan with metrics: {label} ---\n{}",
+        DisplayableExecutionPlan::with_metrics(plan).indent(true)
+    );
+}
+
 fn print_filter_metrics(plan: &dyn ExecutionPlan) {
     for child in plan.children() {
         print_filter_metrics(child.as_ref());
@@ -409,6 +417,12 @@ async fn main() -> Result<()> {
                     mean_wall_ms(&timings)
                 );
                 if let Some(phys) = &last_physical_plan {
+                    if cli.explain_physical {
+                        print_physical_plan_with_metrics(
+                            phys.as_ref(),
+                            &format!("SSB {qid} dim_order={order_label}"),
+                        );
+                    }
                     print_filter_metrics(phys.as_ref());
                 }
             }
@@ -467,6 +481,12 @@ async fn main() -> Result<()> {
                     mean_wall_ms(&timings)
                 );
                 if let Some(phys) = &last_physical_plan {
+                    if cli.explain_physical {
+                        print_physical_plan_with_metrics(
+                            phys.as_ref(),
+                            &format!("SSB {qid} dim_order={order_label}"),
+                        );
+                    }
                     print_filter_metrics(phys.as_ref());
                 }
             }
