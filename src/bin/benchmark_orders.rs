@@ -271,11 +271,12 @@ fn print_filter_metrics(plan: &dyn ExecutionPlan) {
                 .unwrap_or(0);
             let output_rows = metrics.output_rows().unwrap_or(0);
             log::info!(
-                "  LipFilterExec: input={}, output={}, selectivity={}",
+                "  LipFilterExec: input={}, output={}, selectivity={}, time_taken={:.3} s",
                 input_rows,
                 output_rows,
                 // input_rows.saturating_sub(output_rows),
                 output_rows as f32/input_rows as f32,
+                metrics.elapsed_compute().expect("Elapsed time not in metrics") as f32 / 1e9 as f32,
             );
         }
     }

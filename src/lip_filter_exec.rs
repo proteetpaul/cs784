@@ -5,7 +5,7 @@ use datafusion::{arrow::{array::{Array, AsArray, RecordBatch, UInt64Array}, comp
     ArrowPrimitiveType, DataType, Date32Type, Date64Type, Int8Type,
     Int16Type, Int32Type, Int64Type, SchemaRef, UInt8Type, UInt16Type,
     UInt32Type, UInt64Type,
-}}, execution::SendableRecordBatchStream, physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, metrics::{Count, ExecutionPlanMetricsSet, MetricBuilder, MetricsSet}}};
+}}, execution::SendableRecordBatchStream, physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, metrics::{Count, ExecutionPlanMetricsSet, MetricBuilder, MetricsSet, Time}}};
 use datafusion::common::Result;
 use futures::{Stream, StreamExt as _};
 
@@ -81,6 +81,7 @@ impl ExecutionPlan for LipFilterExec {
     ) -> datafusion::error::Result<SendableRecordBatchStream> {
         let input_rows = MetricBuilder::new(&self.metrics).counter("input_rows", partition);
         let output_rows = MetricBuilder::new(&self.metrics).output_rows(partition);
+        let elapsed_compute = MetricBuilder::new(&self.metrics).elapsed_compute(partition);
         let input = self.child.execute(partition, context)?;
         let schema = input.schema();
         let stream = LipFilterStream {
@@ -89,6 +90,7 @@ impl ExecutionPlan for LipFilterExec {
             filters: self.filters.clone(),
             input_rows,
             output_rows,
+            elapsed_compute,
         };
         Ok(Box::pin(stream))
     }
@@ -104,6 +106,7 @@ struct LipFilterStream {
     filters: Arc<Vec<Filter>>,
     input_rows: Count,
     output_rows: Count,
+    elapsed_compute: Time,
 }
 
 impl LipFilterStream {
@@ -170,7 +173,9 @@ impl Stream for LipFilterStream {
         match self.child_stream.poll_next_unpin(cx) {
             Poll::Ready(Some(Ok(batch))) => {
                 self.input_rows.add(batch.num_rows());
+                let timer = self.elapsed_compute.timer();
                 let filtered = self.filter_batch_with_adaptive_reordering(&batch);
+                timer.done();
                 self.output_rows.add(filtered.num_rows());
                 Poll::Ready(Some(Ok(filtered)))
             }

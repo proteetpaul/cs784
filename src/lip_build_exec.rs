@@ -9,6 +9,7 @@ use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::physical_plan::expressions::Column;
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties,
+    metrics::{ExecutionPlanMetricsSet, MetricBuilder, MetricsSet, Time},
 };
 use futures::stream::StreamExt;
 use futures::Stream;
@@ -47,6 +48,7 @@ pub struct LipBuildExec {
     child: Arc<dyn ExecutionPlan>,
     key_column: Column,
     bloom_filter: Arc<RwLock<BloomFilter>>,
+    metrics: ExecutionPlanMetricsSet,
 }
 
 impl std::fmt::Debug for LipBuildExec {
@@ -68,6 +70,7 @@ impl LipBuildExec {
             child,
             key_column,
             bloom_filter: global_filter.clone(),
+            metrics: ExecutionPlanMetricsSet::new(),
         }
     }
 }
@@ -103,6 +106,7 @@ impl ExecutionPlan for LipBuildExec {
             child: children[0].clone(),
             key_column: self.key_column.clone(),
             bloom_filter: self.bloom_filter.clone(),
+            metrics: ExecutionPlanMetricsSet::new(),
         }))
     }
 
@@ -111,6 +115,7 @@ impl ExecutionPlan for LipBuildExec {
         partition: usize,
         context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
+        let elapsed_compute = MetricBuilder::new(&self.metrics).elapsed_compute(partition);
         let input = self.child.execute(partition, context)?;
         let schema = input.schema();
         let filter = self.bloom_filter.read().expect("Unable to lock bloom filter");
@@ -124,8 +129,13 @@ impl ExecutionPlan for LipBuildExec {
             schema,
             num_bits,
             num_hashes,
+            elapsed_compute,
         };
         Ok(Box::pin(stream))
+    }
+
+    fn metrics(&self) -> Option<MetricsSet> {
+        Some(self.metrics.clone_inner())
     }
 }
 
@@ -134,9 +144,9 @@ struct LipBuildStream {
     global_filter: Arc<RwLock<BloomFilter>>,
     key_column: Column,
     schema: SchemaRef,
-    // Parameters to create local bloom filters
     num_bits: usize,
     num_hashes: u32,
+    elapsed_compute: Time,
 }
 
 impl LipBuildStream {
@@ -185,7 +195,9 @@ impl Stream for LipBuildStream {
     ) -> Poll<Option<Self::Item>> {
         match self.child_stream.poll_next_unpin(cx) {
             Poll::Ready(Some(Ok(batch))) => {
+                let timer = self.elapsed_compute.timer();
                 self.insert_batch(&batch);
+                timer.done();
                 Poll::Ready(Some(Ok(batch)))
             }
             other => other,
