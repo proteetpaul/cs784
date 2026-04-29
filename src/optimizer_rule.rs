@@ -223,8 +223,7 @@ impl LIPOptimizerRule {
         // Rebuild bottom-up (innermost join first). Apply each join's projection spine before
         // attaching the next operator so keys match the hash join: blooms are built from
         // dimension key types (e.g. Int32 `d_datekey`) and must probe the same representation
-        // on the fact side (e.g. Int32 `lo_orderdate` after CAST), not raw `lineorder_raw`
-        // Date32 values below the spine.
+        // on the fact side (e.g. Int32 `lo_orderdate`), not `Date32` if the table were left raw.
         for (depth, ((join_plan, wrapped_left), spine)) in joins
             .iter()
             .rev()
