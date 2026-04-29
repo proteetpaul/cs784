@@ -63,6 +63,11 @@ struct Cli {
     #[arg(long, default_value_t = false)]
     explain_physical: bool,
 
+    /// For SSB Q3.* and Q4.* only: omit logical `Aggregate`, effective `GROUP BY`, and **`Sort`** so
+    /// the plan is joins only (no aggregation, no sorting).
+    #[arg(long, default_value_t = false)]
+    skip_aggregate: bool,
+
     /// If set, write `flamegraph.svg` here for the first timed run only (first query in
     /// `--queries`, first dimension join order, first iteration).
     #[arg(long)]
@@ -321,6 +326,9 @@ async fn main() -> Result<()> {
             "off".to_string()
         }
     );
+    if cli.skip_aggregate {
+        log::info!("SSB Q3/Q4 aggregate+sort: skipped (join-only logical plan for Q3.* and Q4.*).");
+    }
 
     if let Some(dir) = &cli.flamegraph_dir {
         fs::create_dir_all(dir).map_err(DataFusionError::IoError)?;
@@ -342,7 +350,13 @@ async fn main() -> Result<()> {
         if let Some(q) = Q3Query::parse(qid) {
             for (d_idx, dim_order) in DIMENSION_JOIN_PERMUTATIONS.iter().enumerate() {
                 let order_label = format_dim_order_q3(dim_order);
-                let plan = join_order_q3::build_q3_logical_plan(&ctx, q, dim_order).await?;
+                let plan = join_order_q3::build_q3_logical_plan(
+                    &ctx,
+                    q,
+                    dim_order,
+                    cli.skip_aggregate,
+                )
+                .await?;
 
                 if cli.explain_physical {
                     print_physical_plan_logical(
@@ -400,7 +414,7 @@ async fn main() -> Result<()> {
         } else if let Some(q) = Q4Query::parse(qid) {
             for (d_idx, dim_order) in Q4_DIMENSION_JOIN_PERMUTATIONS.iter().enumerate() {
                 let order_label = format_dim_order_q4(dim_order);
-                let plan = build_q4_logical_plan(&ctx, q, dim_order).await?;
+                let plan = build_q4_logical_plan(&ctx, q, dim_order, cli.skip_aggregate).await?;
 
                 if cli.explain_physical {
                     print_physical_plan_logical(

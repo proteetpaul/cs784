@@ -1,6 +1,9 @@
-//! Left-deep logical plans for SSB queries 3.1–3.3 (fact `lineorder`, three dimensions).
+//! Logical plans for SSB queries 3.1–3.3 (fact `lineorder`, three dimensions).
 //!
-//! Enumerates all `3! = 6` permutations of join order: `(((lineorder ⋈ d1) ⋈ d2) ⋈ d3)`.
+//! Enumerates all `3! = 6` permutations of which dimension joins first. Each binary join
+//! places the **dimension scan on the left** and the growing subtree (ending in `lineorder`)
+//! on the right, e.g. for order `(d1, d2, d3)` (join `d1` first, then `d2`, then `d3`):
+//! `d3 ⋈ (d2 ⋈ (d1 ⋈ lineorder))`.
 
 use std::fmt;
 use std::sync::Arc;
@@ -8,7 +11,7 @@ use std::sync::Arc;
 use datafusion::common::Result;
 use datafusion::datasource::DefaultTableSource;
 use datafusion::logical_expr::builder::LogicalPlanBuilder;
-use datafusion::logical_expr::{col, lit, Expr, JoinType, LogicalPlan, SortExpr};
+use datafusion::logical_expr::{Expr, JoinType, LogicalPlan, SortExpr, col, lit};
 use datafusion::prelude::SessionContext;
 
 /// SSB query variants supported by this module.
@@ -47,7 +50,7 @@ impl Dimension {
         }
     }
 
-    /// Join predicate between the accumulated plan (which always includes `lineorder`) and this scan.
+    /// Equijoin predicate (dimension columns on the left subtree, `lineorder` columns on the right).
     fn join_on_expr(self) -> Expr {
         match self {
             Dimension::Customer => col("lo_custkey").eq(col("c_custkey")),
@@ -91,7 +94,7 @@ impl fmt::Display for Dimension {
     }
 }
 
-/// All `3!` permutations of dimension join order after `lineorder`.
+/// All `3!` permutations of the order in which dimensions are attached (outermost-first in the chain).
 pub const DIMENSION_JOIN_PERMUTATIONS: [[Dimension; 3]; 6] = [
     [Dimension::Customer, Dimension::Supplier, Dimension::Dates],
     [Dimension::Customer, Dimension::Dates, Dimension::Supplier],
@@ -119,21 +122,33 @@ async fn scan_filtered(
     b.build()
 }
 
-/// Build the full logical plan: left-deep joins, aggregate, sort (matches SSB SQL semantics).
+/// Build the full logical plan: each join has **dimension on the left**, subtree on the right;
+/// then aggregate and sort (same semantics as the SSB SQL).
+///
+/// When `skip_aggregate` is true, aggregate, `GROUP BY`, and **`ORDER BY` / sort are all omitted**
+/// so the plan ends at the join tree only.
 pub async fn build_q3_logical_plan(
     ctx: &SessionContext,
     query: Q3Query,
     dim_order: &[Dimension; 3],
+    skip_aggregate: bool,
 ) -> Result<LogicalPlan> {
-    let lo_src = Arc::new(DefaultTableSource::new(
-        ctx.table_provider("lineorder").await?,
-    ));
-    let mut plan = LogicalPlanBuilder::scan("lineorder", lo_src, None)?;
+    // For permutation (d1, d2, d3): build `d3 ⋈ (d2 ⋈ (d1 ⋈ lineorder))` so the first listed
+    // dimension is innermost with the fact, matching the previous "join d1 first" meaning.
+    let mut acc = scan_filtered(ctx, "lineorder", None).await?;
 
     for dim in dim_order {
-        let right = scan_filtered(ctx, dim.table_name(), Some(dim.filter_expr(query))).await?;
-        plan = plan.join_on(right, JoinType::Inner, [dim.join_on_expr()])?;
+        let left_dim = scan_filtered(ctx, dim.table_name(), Some(dim.filter_expr(query))).await?;
+        acc = LogicalPlanBuilder::from(left_dim)
+            .join_on(acc, JoinType::Inner, [dim.join_on_expr()])?
+            .build()?;
     }
+
+    if skip_aggregate {
+        return LogicalPlanBuilder::from(acc).build();
+    }
+
+    let mut plan = LogicalPlanBuilder::from(acc);
 
     let (group_cols, sort_exprs): (Vec<Expr>, Vec<SortExpr>) = match query {
         Q3Query::Q3_1 => (
@@ -151,8 +166,8 @@ pub async fn build_q3_logical_plan(
             ],
         ),
     };
-
-    let revenue = datafusion::functions_aggregate::expr_fn::sum(col("lo_revenue")).alias("revenue");
+    let revenue =
+        datafusion::functions_aggregate::expr_fn::sum(col("lo_revenue")).alias("revenue");
     plan = plan
         .aggregate(group_cols, vec![revenue])?
         .sort_with_limit(sort_exprs, None)?;

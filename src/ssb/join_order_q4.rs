@@ -271,10 +271,14 @@ async fn scan_filtered(
 }
 
 /// Build the full logical plan: left-deep joins, aggregate, sort (matches SSB SQL semantics).
+///
+/// When `skip_aggregate` is true, aggregate, `GROUP BY`, and **`ORDER BY` / sort are all omitted**
+/// so the plan ends at the join tree only.
 pub async fn build_q4_logical_plan(
     ctx: &SessionContext,
     query: Q4Query,
     dim_order: &[Dimension; 4],
+    skip_aggregate: bool,
 ) -> Result<LogicalPlan> {
     let lo_src = Arc::new(DefaultTableSource::new(
         ctx.table_provider("lineorder").await?,
@@ -286,10 +290,9 @@ pub async fn build_q4_logical_plan(
         plan = plan.join_on(right, JoinType::Inner, [dim.join_on_expr()])?;
     }
 
-    let profit = datafusion::functions_aggregate::expr_fn::sum(
-        col("lo_revenue") - col("lo_supplycost"),
-    )
-    .alias("profit");
+    if skip_aggregate {
+        return plan.build();
+    }
 
     let (group_cols, sort_exprs): (Vec<Expr>, Vec<SortExpr>) = match query {
         Q4Query::Q4_1 => (
@@ -317,6 +320,10 @@ pub async fn build_q4_logical_plan(
         ),
     };
 
+    let profit = datafusion::functions_aggregate::expr_fn::sum(
+        col("lo_revenue") - col("lo_supplycost"),
+    )
+    .alias("profit");
     plan = plan
         .aggregate(group_cols, vec![profit])?
         .sort_with_limit(sort_exprs, None)?;
