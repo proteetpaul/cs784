@@ -1,29 +1,35 @@
-use std::hash::RandomState;
 use std::sync::{Arc, LazyLock, RwLock};
 
-use bloom::{ASMS, BloomFilter, Unionable};
-use datafusion::arrow::array::{Array, Int32Array, Int64Array, RecordBatch, StringArray};
+use ahash::RandomState;
+use bloom::{BloomFilter, ASMS};
+use datafusion::arrow::array::{
+    Array, Date32Array, Int32Array, Int64Array, RecordBatch, StringArray,
+};
 use datafusion::arrow::datatypes::SchemaRef;
-use datafusion::common::{Result};
+use datafusion::common::Result;
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::physical_plan::expressions::Column;
 use datafusion::physical_plan::{
-    DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties,
     metrics::{ExecutionPlanMetricsSet, MetricBuilder, MetricsSet, Time},
+    DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties,
 };
 use futures::stream::StreamExt;
 use futures::Stream;
 
 use std::task::{Context, Poll};
 
-// Always use the same hash builders for the bloom filters to support union operations
-static HASH_BUILDER_ONE: LazyLock<RandomState> = LazyLock::new(RandomState::new);
-static HASH_BUILDER_TWO: LazyLock<RandomState> = LazyLock::new(RandomState::new);
+pub type LipBloomFilter = BloomFilter<RandomState, RandomState>;
+
+// Always use the same independent hash builders for build-side inserts and probe-side lookups.
+static HASH_BUILDER_ONE: LazyLock<RandomState> =
+    LazyLock::new(|| RandomState::with_seeds('L' as u64, 'I' as u64, 'P' as u64, '1' as u64));
+static HASH_BUILDER_TWO: LazyLock<RandomState> =
+    LazyLock::new(|| RandomState::with_seeds('L' as u64, 'I' as u64, 'P' as u64, '2' as u64));
 
 /// Encapsulates a column name and its associated global bloom filter
 pub struct Filter {
     pub column_name: String,
-    pub bloom: Arc<RwLock<BloomFilter>>,
+    pub bloom: Arc<RwLock<LipBloomFilter>>,
 }
 
 impl Filter {
@@ -47,7 +53,7 @@ impl Filter {
 pub struct LipBuildExec {
     child: Arc<dyn ExecutionPlan>,
     key_column: Column,
-    bloom_filter: Arc<RwLock<BloomFilter>>,
+    bloom_filter: Arc<RwLock<LipBloomFilter>>,
     metrics: ExecutionPlanMetricsSet,
 }
 
@@ -64,7 +70,7 @@ impl LipBuildExec {
     pub fn new(
         child: Arc<dyn ExecutionPlan>,
         key_column: Column,
-        global_filter: &Arc<RwLock<BloomFilter>>,
+        global_filter: &Arc<RwLock<LipBloomFilter>>,
     ) -> Self {
         Self {
             child,
@@ -118,17 +124,11 @@ impl ExecutionPlan for LipBuildExec {
         let elapsed_compute = MetricBuilder::new(&self.metrics).elapsed_compute(partition);
         let input = self.child.execute(partition, context)?;
         let schema = input.schema();
-        let filter = self.bloom_filter.read().expect("Unable to lock bloom filter");
-        let num_bits = filter.num_bits();
-        let num_hashes = filter.num_hashes();
-
         let stream = LipBuildStream {
             child_stream: input,
             global_filter: Arc::clone(&self.bloom_filter),
             key_column: self.key_column.clone(),
             schema,
-            num_bits,
-            num_hashes,
             elapsed_compute,
         };
         Ok(Box::pin(stream))
@@ -141,48 +141,42 @@ impl ExecutionPlan for LipBuildExec {
 
 struct LipBuildStream {
     child_stream: SendableRecordBatchStream,
-    global_filter: Arc<RwLock<BloomFilter>>,
+    global_filter: Arc<RwLock<LipBloomFilter>>,
     key_column: Column,
     schema: SchemaRef,
-    num_bits: usize,
-    num_hashes: u32,
     elapsed_compute: Time,
 }
 
 impl LipBuildStream {
     fn insert_batch(&self, batch: &RecordBatch) {
         let key_array = batch.column(self.key_column.index());
-        // Each partition builds a local bloom filter in parallel, and finally combines this with the global filter
-        // TODO(): Use a thread-local filter to avoid repeated initialization
-        let mut local_filter = BloomFilter::with_size_and_hashers(
-            self.num_bits, 
-            self.num_hashes, 
-            (*HASH_BUILDER_ONE).clone(),
-            (*HASH_BUILDER_TWO).clone()
-        );
+        let mut filter = self.global_filter.write().unwrap();
 
         if let Some(arr) = key_array.as_any().downcast_ref::<Int64Array>() {
             for i in 0..arr.len() {
                 if !arr.is_null(i) {
-                    local_filter.insert(&arr.value(i));
+                    filter.insert(&arr.value(i));
                 }
             }
         } else if let Some(arr) = key_array.as_any().downcast_ref::<Int32Array>() {
             for i in 0..arr.len() {
                 if !arr.is_null(i) {
-                    local_filter.insert(&arr.value(i));
+                    filter.insert(&arr.value(i));
+                }
+            }
+        } else if let Some(arr) = key_array.as_any().downcast_ref::<Date32Array>() {
+            for i in 0..arr.len() {
+                if !arr.is_null(i) {
+                    filter.insert(&arr.value(i));
                 }
             }
         } else if let Some(arr) = key_array.as_any().downcast_ref::<StringArray>() {
             for i in 0..arr.len() {
                 if !arr.is_null(i) {
-                    local_filter.insert(&arr.value(i));
+                    filter.insert(&arr.value(i));
                 }
             }
         }
-
-        let mut filter = self.global_filter.write().unwrap();
-        filter.union(&local_filter);
     }
 }
 

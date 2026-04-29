@@ -1,19 +1,34 @@
-use std::{cmp::min, hash::Hash, sync::Arc, task::{Context, Poll}};
+use std::{
+    cmp::min,
+    hash::Hash,
+    sync::Arc,
+    task::{Context, Poll},
+};
 
-use bloom::{ASMS, BloomFilter};
-use datafusion::{arrow::{array::{Array, AsArray, RecordBatch, UInt64Array}, compute::take_arrays, datatypes::{
-    ArrowPrimitiveType, DataType, Date32Type, Date64Type, Int8Type,
-    Int16Type, Int32Type, Int64Type, SchemaRef, UInt8Type, UInt16Type,
-    UInt32Type, UInt64Type,
-}}, execution::SendableRecordBatchStream, physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, metrics::{Count, ExecutionPlanMetricsSet, MetricBuilder, MetricsSet, Time}}};
+use bloom::ASMS;
 use datafusion::common::Result;
+use datafusion::{
+    arrow::{
+        array::{Array, AsArray, RecordBatch, UInt64Array},
+        compute::take_arrays,
+        datatypes::{
+            ArrowPrimitiveType, DataType, Date32Type, Date64Type, Int16Type, Int32Type, Int64Type,
+            Int8Type, SchemaRef, UInt16Type, UInt32Type, UInt64Type, UInt8Type,
+        },
+    },
+    execution::SendableRecordBatchStream,
+    physical_plan::{
+        metrics::{Count, ExecutionPlanMetricsSet, MetricBuilder, MetricsSet, Time},
+        DisplayAs, DisplayFormatType, ExecutionPlan,
+    },
+};
 use futures::{Stream, StreamExt as _};
 
-use crate::lip_build_exec::Filter;
+use crate::lip_build_exec::{Filter, LipBloomFilter};
 
 /// Execution node responsible for pre-filtering the probe-side input
 /// in a right-deep join tree using LIP. The input is filtered using bloom
-/// filters and the result is passed to the HashJoinExec node 
+/// filters and the result is passed to the HashJoinExec node
 pub struct LipFilterExec {
     child: Arc<dyn ExecutionPlan>,
     filters: Arc<Vec<Filter>>,
@@ -125,27 +140,81 @@ impl LipFilterStream {
         let mut result_indexes = Vec::with_capacity(batch.num_rows());
 
         while loc < batch.num_rows() {
-            let mut probe_indexes: Vec<usize> = (loc..min(loc+batch_size, batch.num_rows())).collect();
+            let mut probe_indexes: Vec<usize> =
+                (loc..min(loc + batch_size, batch.num_rows())).collect();
             for filter_idx in &self.filter_ordering.clone() {
                 let filter = &self.filters[*filter_idx];
-                let (column_idx, field) = self.schema.column_with_name(&filter.column_name).unwrap_or_else(|| {
-                    panic!("Invalid column name: {}", filter.column_name);
-                });
+                let (column_idx, field) = self
+                    .schema
+                    .column_with_name(&filter.column_name)
+                    .unwrap_or_else(|| {
+                        panic!("Invalid column name: {}", filter.column_name);
+                    });
                 let bloom_filter = filter.bloom.read().expect("Couldn't read bloom filter");
                 let filtered_indexes: Vec<usize> = match field.data_type() {
-                    DataType::Int8 => probe_filter_using_column::<Int8Type>(&bloom_filter, &probe_indexes, batch, column_idx),
-                    DataType::Int16 => probe_filter_using_column::<Int16Type>(&bloom_filter, &probe_indexes, batch, column_idx),
-                    DataType::Int32 => probe_filter_using_column::<Int32Type>(&bloom_filter, &probe_indexes, batch, column_idx),
-                    DataType::Int64 => probe_filter_using_column::<Int64Type>(&bloom_filter, &probe_indexes, batch, column_idx),
-                    DataType::UInt8 => probe_filter_using_column::<UInt8Type>(&bloom_filter, &probe_indexes, batch, column_idx),
-                    DataType::UInt16 => probe_filter_using_column::<UInt16Type>(&bloom_filter, &probe_indexes, batch, column_idx),
-                    DataType::UInt32 => probe_filter_using_column::<UInt32Type>(&bloom_filter, &probe_indexes, batch, column_idx),
-                    DataType::UInt64 => probe_filter_using_column::<UInt64Type>(&bloom_filter, &probe_indexes, batch, column_idx),
-                    DataType::Date32 => probe_filter_using_column::<Date32Type>(&bloom_filter, &probe_indexes, batch, column_idx),
-                    DataType::Date64 => probe_filter_using_column::<Date64Type>(&bloom_filter, &probe_indexes, batch, column_idx),
+                    DataType::Int8 => probe_filter_using_column::<Int8Type>(
+                        &bloom_filter,
+                        &probe_indexes,
+                        batch,
+                        column_idx,
+                    ),
+                    DataType::Int16 => probe_filter_using_column::<Int16Type>(
+                        &bloom_filter,
+                        &probe_indexes,
+                        batch,
+                        column_idx,
+                    ),
+                    DataType::Int32 => probe_filter_using_column::<Int32Type>(
+                        &bloom_filter,
+                        &probe_indexes,
+                        batch,
+                        column_idx,
+                    ),
+                    DataType::Int64 => probe_filter_using_column::<Int64Type>(
+                        &bloom_filter,
+                        &probe_indexes,
+                        batch,
+                        column_idx,
+                    ),
+                    DataType::UInt8 => probe_filter_using_column::<UInt8Type>(
+                        &bloom_filter,
+                        &probe_indexes,
+                        batch,
+                        column_idx,
+                    ),
+                    DataType::UInt16 => probe_filter_using_column::<UInt16Type>(
+                        &bloom_filter,
+                        &probe_indexes,
+                        batch,
+                        column_idx,
+                    ),
+                    DataType::UInt32 => probe_filter_using_column::<UInt32Type>(
+                        &bloom_filter,
+                        &probe_indexes,
+                        batch,
+                        column_idx,
+                    ),
+                    DataType::UInt64 => probe_filter_using_column::<UInt64Type>(
+                        &bloom_filter,
+                        &probe_indexes,
+                        batch,
+                        column_idx,
+                    ),
+                    DataType::Date32 => probe_filter_using_column::<Date32Type>(
+                        &bloom_filter,
+                        &probe_indexes,
+                        batch,
+                        column_idx,
+                    ),
+                    DataType::Date64 => probe_filter_using_column::<Date64Type>(
+                        &bloom_filter,
+                        &probe_indexes,
+                        batch,
+                        column_idx,
+                    ),
                     other => panic!("Unsupported datatype: {}", other),
                 };
-                
+
                 self.count_map[*filter_idx] += probe_indexes.len();
                 self.miss_map[*filter_idx] += probe_indexes.len() - filtered_indexes.len();
                 probe_indexes = filtered_indexes;
@@ -198,7 +267,7 @@ impl datafusion::execution::RecordBatchStream for LipFilterStream {
 
 /// Keep rows whose keys may be in `filter` (Bloom `contains`), or null keys (never inserted, passed through).
 fn probe_filter_using_column<T>(
-    filter: &BloomFilter,
+    filter: &LipBloomFilter,
     probe_indexes: &[usize],
     batch: &RecordBatch,
     column_idx: usize,
