@@ -22,6 +22,7 @@ use datafusion::physical_plan::joins::{HashJoinExec, PartitionMode};
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::prelude::{SessionConfig, SessionContext};
 
+use lip_datafusion::lip_filter_exec::LipFilterExec;
 use lip_datafusion::optimizer_rule::LIPOptimizerRule;
 use lip_datafusion::ssb::coerce_join_order::CoerceSsbHashJoinBuildSide;
 use lip_datafusion::ssb::join_order_q3::{
@@ -162,13 +163,19 @@ fn mean_wall_ms(timings: &[Duration]) -> f64 {
     timings.iter().map(|d| d.as_secs_f64()).sum::<f64>() * 1000.0 / n
 }
 
-async fn run_logical_plan(ctx: &SessionContext, plan: LogicalPlan) -> Result<(usize, Duration)> {
+async fn run_logical_plan(
+    ctx: &SessionContext,
+    plan: LogicalPlan,
+) -> Result<(usize, Duration, Arc<dyn ExecutionPlan>)> {
     let df = DataFrame::new(ctx.state().clone(), plan);
+    let physical_plan = df.create_physical_plan().await?;
+    let task_ctx = ctx.task_ctx();
     let start = Instant::now();
-    let batches = df.collect().await?;
+    let batches =
+        datafusion::physical_plan::collect(physical_plan.clone(), task_ctx).await?;
     let elapsed = start.elapsed();
     let row_count: usize = batches.iter().map(|b| b.num_rows()).sum();
-    Ok((row_count, elapsed))
+    Ok((row_count, elapsed, physical_plan))
 }
 
 /// Runs `run_logical_plan` while optionally sampling stacks and writing an SVG flamegraph.
@@ -176,7 +183,7 @@ async fn run_logical_plan_with_optional_flamegraph(
     ctx: &SessionContext,
     plan: LogicalPlan,
     flamegraph_svg: Option<&Path>,
-) -> Result<(usize, Duration)> {
+) -> Result<(usize, Duration, Arc<dyn ExecutionPlan>)> {
     match flamegraph_svg {
         Some(svg_path) => {
             let guard = ProfilerGuardBuilder::default()
@@ -185,7 +192,7 @@ async fn run_logical_plan_with_optional_flamegraph(
                 .build()
                 .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
-            let timing = run_logical_plan(ctx, plan).await?;
+            let result = run_logical_plan(ctx, plan).await?;
 
             let report = guard
                 .report()
@@ -204,7 +211,7 @@ async fn run_logical_plan_with_optional_flamegraph(
                 .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
             log::info!("Wrote flamegraph to {}", svg_path.display());
-            Ok(timing)
+            Ok(result)
         }
         None => run_logical_plan(ctx, plan).await,
     }
@@ -222,6 +229,51 @@ async fn print_physical_plan_logical(
         displayable(plan.as_ref()).indent(true)
     );
     Ok(())
+}
+
+fn print_filter_metrics(plan: &dyn ExecutionPlan) {
+    for child in plan.children() {
+        print_filter_metrics(child.as_ref());
+    }
+    if let Some(hj) = plan.as_any().downcast_ref::<HashJoinExec>() {
+        if let Some(metrics) = plan.metrics() {
+            let on_cols: Vec<String> = hj
+                .on()
+                .iter()
+                .map(|(l, r)| format!("{}={}", l, r))
+                .collect();
+            let output_rows = metrics.output_rows().unwrap_or(0);
+            let probe_child = plan.children().get(1).and_then(|c| c.metrics());
+            let probe_input = probe_child
+                .and_then(|m| m.output_rows())
+                .unwrap_or(0);
+            log::info!(
+                "  HashJoinExec [{}]: probe_input={}, output={}, selectivity={}, time_taken={:.3} s",
+                on_cols.join(", "),
+                probe_input,
+                output_rows,
+                // probe_input.saturating_sub(output_rows),
+                output_rows as f32/probe_input as f32,
+                metrics.elapsed_compute().expect("Elapsed time not in metrics") as f32 / 1e9 as f32,
+            );
+        }
+    }
+    if plan.as_any().downcast_ref::<LipFilterExec>().is_some() {
+        if let Some(metrics) = plan.metrics() {
+            let input_rows = metrics
+                .sum_by_name("input_rows")
+                .map(|m| m.as_usize())
+                .unwrap_or(0);
+            let output_rows = metrics.output_rows().unwrap_or(0);
+            log::info!(
+                "  LipFilterExec: input={}, output={}, selectivity={}",
+                input_rows,
+                output_rows,
+                // input_rows.saturating_sub(output_rows),
+                output_rows as f32/input_rows as f32,
+            );
+        }
+    }
 }
 
 #[tokio::main]
@@ -303,20 +355,23 @@ async fn main() -> Result<()> {
 
                 let mut timings = Vec::with_capacity(cli.iterations);
                 let mut row_count = 0usize;
+                let mut last_physical_plan: Option<Arc<dyn ExecutionPlan>> = None;
 
                 for it in 0..cli.iterations {
                     let flamegraph_svg = (q_idx == 0 && d_idx == 0 && it == 0)
                         .then(|| cli.flamegraph_dir.as_ref().map(|dir| dir.join("flamegraph.svg")))
                         .flatten();
 
-                    let (rows, elapsed) = run_logical_plan_with_optional_flamegraph(
-                        &ctx,
-                        plan.clone(),
-                        flamegraph_svg.as_deref(),
-                    )
-                    .await?;
+                    let (rows, elapsed, physical_plan) =
+                        run_logical_plan_with_optional_flamegraph(
+                            &ctx,
+                            plan.clone(),
+                            flamegraph_svg.as_deref(),
+                        )
+                        .await?;
                     row_count = rows;
                     timings.push(elapsed);
+                    last_physical_plan = Some(physical_plan);
 
                     if it == 0 {
                         match expected_rows {
@@ -338,6 +393,9 @@ async fn main() -> Result<()> {
                     row_count,
                     mean_wall_ms(&timings)
                 );
+                if let Some(phys) = &last_physical_plan {
+                    print_filter_metrics(phys.as_ref());
+                }
             }
         } else if let Some(q) = Q4Query::parse(qid) {
             for (d_idx, dim_order) in Q4_DIMENSION_JOIN_PERMUTATIONS.iter().enumerate() {
@@ -355,20 +413,23 @@ async fn main() -> Result<()> {
 
                 let mut timings = Vec::with_capacity(cli.iterations);
                 let mut row_count = 0usize;
+                let mut last_physical_plan: Option<Arc<dyn ExecutionPlan>> = None;
 
                 for it in 0..cli.iterations {
                     let flamegraph_svg = (q_idx == 0 && d_idx == 0 && it == 0)
                         .then(|| cli.flamegraph_dir.as_ref().map(|dir| dir.join("flamegraph.svg")))
                         .flatten();
 
-                    let (rows, elapsed) = run_logical_plan_with_optional_flamegraph(
-                        &ctx,
-                        plan.clone(),
-                        flamegraph_svg.as_deref(),
-                    )
-                    .await?;
+                    let (rows, elapsed, physical_plan) =
+                        run_logical_plan_with_optional_flamegraph(
+                            &ctx,
+                            plan.clone(),
+                            flamegraph_svg.as_deref(),
+                        )
+                        .await?;
                     row_count = rows;
                     timings.push(elapsed);
+                    last_physical_plan = Some(physical_plan);
 
                     if it == 0 {
                         match expected_rows {
@@ -390,6 +451,9 @@ async fn main() -> Result<()> {
                     row_count,
                     mean_wall_ms(&timings)
                 );
+                if let Some(phys) = &last_physical_plan {
+                    print_filter_metrics(phys.as_ref());
+                }
             }
         }
     }

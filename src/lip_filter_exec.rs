@@ -5,7 +5,7 @@ use datafusion::{arrow::{array::{Array, AsArray, RecordBatch, UInt64Array}, comp
     ArrowPrimitiveType, DataType, Date32Type, Date64Type, Int8Type,
     Int16Type, Int32Type, Int64Type, SchemaRef, UInt8Type, UInt16Type,
     UInt32Type, UInt64Type,
-}}, execution::SendableRecordBatchStream, physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan}};
+}}, execution::SendableRecordBatchStream, physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, metrics::{Count, ExecutionPlanMetricsSet, MetricBuilder, MetricsSet}}};
 use datafusion::common::Result;
 use futures::{Stream, StreamExt as _};
 
@@ -17,6 +17,7 @@ use crate::lip_build_exec::Filter;
 pub struct LipFilterExec {
     child: Arc<dyn ExecutionPlan>,
     filters: Arc<Vec<Filter>>,
+    metrics: ExecutionPlanMetricsSet,
 }
 
 impl std::fmt::Debug for LipFilterExec {
@@ -40,6 +41,7 @@ impl LipFilterExec {
         LipFilterExec {
             child: child.clone(),
             filters: Arc::new(filters),
+            metrics: ExecutionPlanMetricsSet::new(),
         }
     }
 }
@@ -68,6 +70,7 @@ impl ExecutionPlan for LipFilterExec {
         Ok(Arc::new(LipFilterExec {
             child: children[0].clone(),
             filters: Arc::clone(&self.filters),
+            metrics: ExecutionPlanMetricsSet::new(),
         }))
     }
 
@@ -76,14 +79,22 @@ impl ExecutionPlan for LipFilterExec {
         partition: usize,
         context: std::sync::Arc<datafusion::execution::TaskContext>,
     ) -> datafusion::error::Result<SendableRecordBatchStream> {
+        let input_rows = MetricBuilder::new(&self.metrics).counter("input_rows", partition);
+        let output_rows = MetricBuilder::new(&self.metrics).output_rows(partition);
         let input = self.child.execute(partition, context)?;
         let schema = input.schema();
         let stream = LipFilterStream {
             child_stream: input,
             schema,
             filters: self.filters.clone(),
+            input_rows,
+            output_rows,
         };
         Ok(Box::pin(stream))
+    }
+
+    fn metrics(&self) -> Option<MetricsSet> {
+        Some(self.metrics.clone_inner())
     }
 }
 
@@ -91,6 +102,8 @@ struct LipFilterStream {
     child_stream: SendableRecordBatchStream,
     schema: SchemaRef,
     filters: Arc<Vec<Filter>>,
+    input_rows: Count,
+    output_rows: Count,
 }
 
 impl LipFilterStream {
@@ -156,7 +169,10 @@ impl Stream for LipFilterStream {
     ) -> Poll<Option<Self::Item>> {
         match self.child_stream.poll_next_unpin(cx) {
             Poll::Ready(Some(Ok(batch))) => {
-                Poll::Ready(Some(Ok(self.filter_batch_with_adaptive_reordering(&batch))))
+                self.input_rows.add(batch.num_rows());
+                let filtered = self.filter_batch_with_adaptive_reordering(&batch);
+                self.output_rows.add(filtered.num_rows());
+                Poll::Ready(Some(Ok(filtered)))
             }
             other => other,
         }
