@@ -60,6 +60,10 @@ struct Cli {
     #[arg(long, default_value_t = 0.01)]
     lip_fp_rate: f32,
 
+    /// DataFusion batch size (number of rows per RecordBatch)
+    #[arg(long, default_value_t = 8192)]
+    batch_size: usize,
+
     /// Print the optimized physical plan for each query and dimension join order
     #[arg(long, default_value_t = false)]
     explain_physical: bool,
@@ -111,7 +115,7 @@ impl PhysicalOptimizerRule for ResolveHashJoinAutoMode {
     }
 }
 
-fn build_session(lip: bool, lip_fp_rate: f32) -> SessionContext {
+fn build_session(lip: bool, lip_fp_rate: f32, batch_size: usize) -> SessionContext {
     // Swap out `join_selection` only: keep all other default physical rules.
     let default_phys = PhysicalOptimizer::new();
     let rules: Vec<_> = default_phys
@@ -136,15 +140,12 @@ fn build_session(lip: bool, lip_fp_rate: f32) -> SessionContext {
         rules_with_coerce.push(rule);
     }
 
-    let mut session_config = SessionConfig::new();
-    // if lip {
-    // LIP already injects Bloom semi-join style filtering; disable DataFusion join/topk/aggregate
-    // dynamic filter pushdown to avoid stacking two mechanisms on the same plans.
+    let mut session_config = SessionConfig::new()
+        .with_batch_size(batch_size);
     session_config = session_config.set_bool(
         "datafusion.optimizer.enable_dynamic_filter_pushdown",
         false,
     );
-    // }
 
     let mut builder = SessionStateBuilder::new()
         .with_config(session_config)
@@ -319,7 +320,7 @@ async fn main() -> Result<()> {
         "Reading SSB .tbl files from {} into memory ...",
         cli.data_dir.display()
     );
-    let ctx = build_session(cli.lip, cli.lip_fp_rate);
+    let ctx = build_session(cli.lip, cli.lip_fp_rate, cli.batch_size);
     load::register_ssb_tables(&ctx, &cli.data_dir).await?;
 
     log::info!(
