@@ -14,6 +14,7 @@ use crate::lip_filter_exec::LipFilterExec;
 #[derive(Debug)]
 pub struct LIPOptimizerRule {
     bloom_fp_rate: f32,
+    adaptive_filter_reordering: bool,
 }
 
 impl PhysicalOptimizerRule for LIPOptimizerRule {
@@ -39,7 +40,17 @@ impl PhysicalOptimizerRule for LIPOptimizerRule {
 
 impl LIPOptimizerRule {
     pub fn new(bloom_fp_rate: f32) -> Self {
-        Self { bloom_fp_rate }
+        Self::with_bloom_fp_rate_and_adaptive_reorder(bloom_fp_rate, true)
+    }
+
+    pub fn with_bloom_fp_rate_and_adaptive_reorder(
+        bloom_fp_rate: f32,
+        adaptive_filter_reordering: bool,
+    ) -> Self {
+        Self {
+            bloom_fp_rate,
+            adaptive_filter_reordering,
+        }
     }
 
     /// Validates that the plan contains at least one right-deep join chain
@@ -238,6 +249,7 @@ impl LIPOptimizerRule {
                 right_child = Arc::new(LipFilterExec::new(
                     &right_child,
                     lip_filters.take().expect("LIP filters set once"),
+                    self.adaptive_filter_reordering,
                 ))
                 .with_new_children(vec![right_child])?;
             }

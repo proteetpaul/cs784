@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use clap::Parser;
+use clap::{ArgAction, Parser};
 use datafusion::common::config::ConfigOptions;
 use datafusion::common::tree_node::{
     Transformed, TransformedResult, TreeNode,
@@ -59,6 +59,14 @@ struct Cli {
 
     #[arg(long, default_value_t = 0.01)]
     lip_fp_rate: f32,
+
+    /// When `--lip` is set, adaptive Bloom probe order is on by default (LIP paper). Use `--no-lip-adaptive-reorder` for fixed join order.
+    #[arg(
+        long = "no-lip-adaptive-reorder",
+        default_value_t = true,
+        action = ArgAction::SetFalse
+    )]
+    lip_adaptive_reorder: bool,
 
     /// DataFusion batch size (number of rows per RecordBatch)
     #[arg(long, default_value_t = 8192)]
@@ -115,7 +123,12 @@ impl PhysicalOptimizerRule for ResolveHashJoinAutoMode {
     }
 }
 
-fn build_session(lip: bool, lip_fp_rate: f32, batch_size: usize) -> SessionContext {
+fn build_session(
+    lip: bool,
+    lip_fp_rate: f32,
+    lip_adaptive_reorder: bool,
+    batch_size: usize,
+) -> SessionContext {
     // Swap out `join_selection` only: keep all other default physical rules.
     let default_phys = PhysicalOptimizer::new();
     let rules: Vec<_> = default_phys
@@ -153,9 +166,12 @@ fn build_session(lip: bool, lip_fp_rate: f32, batch_size: usize) -> SessionConte
         .with_default_features();
 
     if lip {
-        builder = builder.with_physical_optimizer_rule(Arc::new(LIPOptimizerRule::new(
-            lip_fp_rate,
-        )));
+        builder = builder.with_physical_optimizer_rule(Arc::new(
+            LIPOptimizerRule::with_bloom_fp_rate_and_adaptive_reorder(
+                lip_fp_rate,
+                lip_adaptive_reorder,
+            ),
+        ));
     }
 
     let state = builder.build();
@@ -337,7 +353,12 @@ async fn main() -> Result<()> {
         "Reading SSB .tbl files from {} into memory ...",
         cli.data_dir.display()
     );
-    let ctx = build_session(cli.lip, cli.lip_fp_rate, cli.batch_size);
+    let ctx = build_session(
+        cli.lip,
+        cli.lip_fp_rate,
+        cli.lip_adaptive_reorder,
+        cli.batch_size,
+    );
     load::register_ssb_tables(&ctx, &cli.data_dir).await?;
 
     log::info!(
