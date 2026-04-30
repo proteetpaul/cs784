@@ -170,6 +170,23 @@ fn mean_wall_ms(timings: &[Duration]) -> f64 {
     timings.iter().map(|d| d.as_secs_f64()).sum::<f64>() * 1000.0 / n
 }
 
+fn median_wall_ms(timings: &[Duration]) -> f64 {
+    if timings.is_empty() {
+        return 0.0;
+    }
+    let mut ms: Vec<f64> = timings
+        .iter()
+        .map(|d| d.as_secs_f64() * 1000.0)
+        .collect();
+    ms.sort_by(f64::total_cmp);
+    let mid = ms.len() / 2;
+    if ms.len() % 2 == 1 {
+        ms[mid]
+    } else {
+        (ms[mid - 1] + ms[mid]) / 2.0
+    }
+}
+
 async fn run_logical_plan(
     ctx: &SessionContext,
     plan: LogicalPlan,
@@ -354,6 +371,8 @@ async fn main() -> Result<()> {
     );
     log::info!("{}", "-".repeat(80));
 
+    let mut all_timings = Vec::<Duration>::new();
+
     for (q_idx, qid) in query_ids.iter().enumerate() {
         let mut expected_rows: Option<usize> = None;
 
@@ -417,6 +436,7 @@ async fn main() -> Result<()> {
                     row_count,
                     mean_wall_ms(&timings)
                 );
+                all_timings.extend(timings);
                 if let Some(phys) = &last_physical_plan {
                     if cli.explain_physical {
                         print_physical_plan_with_metrics(
@@ -481,6 +501,7 @@ async fn main() -> Result<()> {
                     row_count,
                     mean_wall_ms(&timings)
                 );
+                all_timings.extend(timings);
                 if let Some(phys) = &last_physical_plan {
                     if cli.explain_physical {
                         print_physical_plan_with_metrics(
@@ -493,6 +514,13 @@ async fn main() -> Result<()> {
             }
         }
     }
+
+    log::info!(
+        "All runs: average {:.2} ms, median {:.2} ms ({} timed executions)",
+        mean_wall_ms(&all_timings),
+        median_wall_ms(&all_timings),
+        all_timings.len()
+    );
 
     Ok(())
 }
