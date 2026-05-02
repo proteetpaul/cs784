@@ -274,17 +274,21 @@ fn print_filter_metrics(plan: &dyn ExecutionPlan) {
                 .map(|(l, r)| format!("{}={}", l, r))
                 .collect();
             let output_rows = metrics.output_rows().unwrap_or(0);
+            let build_child = plan.children().get(0).and_then(|c| c.metrics());
+            let build_input = build_child
+                .and_then(|m| m.output_rows())
+                .unwrap_or(0);
             let probe_child = plan.children().get(1).and_then(|c| c.metrics());
             let probe_input = probe_child
                 .and_then(|m| m.output_rows())
                 .unwrap_or(0);
             log::info!(
-                "  HashJoinExec [{}]: probe_input={}, output={}, selectivity={}, time_taken={:.3} s",
+                "  HashJoinExec [{}]: build_input={}, probe_input={}, output={}, selectivity={}, time_taken={:.3} s",
                 on_cols.join(", "),
+                build_input,
                 probe_input,
                 output_rows,
-                // probe_input.saturating_sub(output_rows),
-                output_rows as f32/probe_input as f32,
+                output_rows as f32 / probe_input as f32,
                 metrics.elapsed_compute().expect("Elapsed time not in metrics") as f32 / 1e9 as f32,
             );
         }

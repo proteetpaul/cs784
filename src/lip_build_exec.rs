@@ -34,14 +34,22 @@ pub struct Filter {
 
 impl Filter {
     pub fn new(column_name: String, fp_rate: f32, expected_num_items: u32) -> Filter {
+        let bloom = BloomFilter::with_rate_and_hashers(
+            fp_rate,
+            expected_num_items,
+            (*HASH_BUILDER_ONE).clone(),
+            (*HASH_BUILDER_TWO).clone(),
+        );
+        eprintln!(
+            "[LIPOptimizerRule] Bloom filter column={}: num_hashes={}, num_bits={}, estimated_elements={}",
+            column_name,
+            bloom.num_hashes(),
+            bloom.num_bits(),
+            expected_num_items
+        );
         Filter {
             column_name,
-            bloom: Arc::new(RwLock::new(BloomFilter::with_rate_and_hashers(
-                fp_rate,
-                expected_num_items,
-                (*HASH_BUILDER_ONE).clone(),
-                (*HASH_BUILDER_TWO).clone(),
-            ))),
+            bloom: Arc::new(RwLock::new(bloom)),
         }
     }
 }
