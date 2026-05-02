@@ -10,7 +10,7 @@ use datafusion::common::Result;
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::physical_plan::expressions::Column;
 use datafusion::physical_plan::{
-    metrics::{ExecutionPlanMetricsSet, MetricBuilder, MetricsSet, Time},
+    metrics::{Count, ExecutionPlanMetricsSet, MetricBuilder, MetricsSet, Time},
     DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties,
 };
 use futures::stream::StreamExt;
@@ -129,6 +129,7 @@ impl ExecutionPlan for LipBuildExec {
         partition: usize,
         context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
+        let output_rows = MetricBuilder::new(&self.metrics).output_rows(partition);
         let elapsed_compute = MetricBuilder::new(&self.metrics).elapsed_compute(partition);
         let input = self.child.execute(partition, context)?;
         let schema = input.schema();
@@ -137,6 +138,7 @@ impl ExecutionPlan for LipBuildExec {
             global_filter: Arc::clone(&self.bloom_filter),
             key_column: self.key_column.clone(),
             schema,
+            output_rows,
             elapsed_compute,
         };
         Ok(Box::pin(stream))
@@ -152,6 +154,7 @@ struct LipBuildStream {
     global_filter: Arc<RwLock<LipBloomFilter>>,
     key_column: Column,
     schema: SchemaRef,
+    output_rows: Count,
     elapsed_compute: Time,
 }
 
@@ -199,6 +202,7 @@ impl Stream for LipBuildStream {
             Poll::Ready(Some(Ok(batch))) => {
                 let timer = self.elapsed_compute.timer();
                 self.insert_batch(&batch);
+                self.output_rows.add(batch.num_rows());
                 timer.done();
                 Poll::Ready(Some(Ok(batch)))
             }
